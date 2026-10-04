@@ -1,0 +1,320 @@
+# NotionHub generated workflow v34
+name: Flomo
+run-name: ${{ github.workflow }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      notionhub_run_id:
+        description: NotionHub 内部运行标识
+        required: false
+        default: ''
+      reason:
+        description: 触发原因
+        required: false
+        default: manual
+      sync_mode:
+        description: 同步模式
+        required: false
+        default: incremental
+        type: choice
+        options:
+          - incremental
+          - full
+      payload:
+        description: 同步参数 JSON
+        required: false
+        default: '{}'
+  schedule:
+    - cron: '0 16 * * *'
+
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: notionhub-flomo-sync-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: 同步 Flomo
+    runs-on: ubuntu-latest
+    env:
+      FLOMO_CONFIG: ${{ secrets.FLOMO_CONFIG }}
+      NOTIONHUB_API_BASE: https://i.notionhub.app/v1
+      NOTIONHUB_SERVICE: flomo
+      NOTIONHUB_CONFIG_VERSION: '51'
+      SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
+      SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
+    steps:
+      - name: 验证运行配置
+        id: activation
+        env:
+          SERVICE_CONFIG: ${{ secrets.FLOMO_CONFIG }}
+        run: |
+          if [ -z "$SERVICE_CONFIG" ]; then
+            echo "::notice title=Flomo尚未配置::请先在插件中完成配置并保存。"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.FLOMO_SYNC_PLAN // "lifetime"')
+          REMAINING=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.FLOMO_TRIAL_RUNS_REMAINING // 1')
+          if [ "$PLAN" = "trial" ] && { ! [[ "$REMAINING" =~ ^[0-9]+$ ]] || [ "$REMAINING" -le 0 ]; }; then
+            echo "免费体验次数已用完，请购买激活码。"
+            echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
+            {
+              echo "## 免费体验次数已用完"
+              echo ""
+              echo "请购买激活码并在 NotionHub 插件中完成激活后重新同步。"
+              echo ""
+              echo "[查看如何获取激活码](https://www.notionhub.app/docs/get-activation-code.html)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=免费体验次数已用完::免费体验次数已用完，请购买激活码并在 NotionHub 插件中完成激活后重新同步。%0A%0A获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "plan=$PLAN" >> "$GITHUB_OUTPUT"
+
+      - name: 验证权限并获取运行程序
+        id: authorize
+        if: steps.activation.outputs.enabled == 'true'
+        run: |
+          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
+          if [ -z "$OIDC_TOKEN" ]; then
+            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
+            exit 1
+          fi
+          echo "::add-mask::$OIDC_TOKEN"
+          RUNTIME_PAYLOAD='{"service":"flomo","purpose":"sync"}'
+          RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
+          RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
+          RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
+          cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
+          trap cleanup_runtime_files EXIT
+          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          if [ "$HTTP_STATUS" = "418" ]; then
+            echo "免费体验次数已用完，请购买激活码。"
+            echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
+            {
+              echo "## 免费体验次数已用完"
+              echo ""
+              echo "请购买激活码并在 NotionHub 插件中完成激活后重新同步。"
+              echo ""
+              echo "[查看如何获取激活码](https://www.notionhub.app/docs/get-activation-code.html)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=免费体验次数已用完::免费体验次数已用完，请购买激活码并在 NotionHub 插件中完成激活后重新同步。%0A%0A获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
+            exit 1
+          fi
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            MESSAGE=$(jq -r '.message // "运行准备失败"' "$RUNTIME_RESPONSE" 2>/dev/null || echo "运行准备失败")
+            echo "::error title=运行准备失败::$MESSAGE"
+            exit 1
+          fi
+          chmod 600 "$RUNTIME_RESPONSE"
+          python3 - "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE" "flomo" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          source, metadata_path, archive_path, expected_service = sys.argv[1:]
+          raw = open(source, 'rb').read()
+          magic = b'NHRB1\n'
+          if not raw.startswith(magic) or len(raw) < len(magic) + 8:
+              raise SystemExit('运行程序响应格式无效。')
+          length_bytes = raw[len(magic):len(magic) + 8]
+          if not re.fullmatch(rb'[0-9a-fA-F]{8}', length_bytes):
+              raise SystemExit('运行配置长度无效。')
+          metadata_length = int(length_bytes, 16)
+          if metadata_length <= 0 or metadata_length > 1024 * 1024:
+              raise SystemExit('运行配置超过大小限制。')
+          metadata_start = len(magic) + 8
+          metadata_end = metadata_start + metadata_length
+          if metadata_end >= len(raw):
+              raise SystemExit('运行程序响应不完整。')
+          try:
+              metadata = json.loads(raw[metadata_start:metadata_end].decode('utf-8'))
+          except Exception:
+              raise SystemExit('运行配置格式无效。')
+          archive = raw[metadata_end:]
+          if metadata.get('schemaVersion') != 1:
+              raise SystemExit('运行配置版本不受支持。')
+          if metadata.get('context', {}).get('service') != expected_service:
+              raise SystemExit('运行配置与当前服务不匹配。')
+          expected_size = metadata.get('bundle', {}).get('size')
+          if not isinstance(expected_size, int) or expected_size != len(archive) or not archive or len(archive) > 64 * 1024 * 1024:
+              raise SystemExit('运行程序大小校验失败。')
+          for path, data in ((metadata_path, json.dumps(metadata, ensure_ascii=False, separators=(',', ':')).encode()), (archive_path, archive)):
+              with open(path, 'wb') as handle:
+                  handle.write(data)
+              os.chmod(path, 0o600)
+          PY
+          ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
+          REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
+          PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
+          POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
+          POLICY_SIGNATURE=$(jq -r '.policySignature // empty' "$RUNTIME_METADATA")
+          SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
+          EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
+          EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error title=运行准备失败::运行配置缺少必要字段。"
+            exit 1
+          fi
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          python3 - "$RUNTIME_METADATA" <<'PY'
+          import json
+          import sys
+          metadata = json.load(open(sys.argv[1], encoding='utf-8'))
+          for value in metadata.get('serviceConfig', {}).values():
+              escaped = str(value).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              if len(escaped) >= 8:
+                  print(f'::add-mask::{escaped}')
+          PY
+          ACTUAL_SIZE=$(wc -c < "$RUNTIME_ARCHIVE" | tr -d ' ')
+          ACTUAL_SHA256=$(sha256sum "$RUNTIME_ARCHIVE" | awk '{print $1}')
+          if [ "$ACTUAL_SIZE" != "$EXPECTED_SIZE" ] || [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error title=运行程序校验失败::下载内容的大小或 SHA-256 不匹配。"
+            exit 1
+          fi
+          if tar -tzf "$RUNTIME_ARCHIVE" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo "::error title=运行程序校验失败::运行程序包含不安全路径。"
+            exit 1
+          fi
+          tar -xzf "$RUNTIME_ARCHIVE"
+          test -f runner/requirements.txt
+          test -d runner/notionhub_runner
+          {
+            echo "NOTIONHUB_RUN_ACCESS_TOKEN=$ACCESS_TOKEN"
+            echo "NOTIONHUB_REPORT_TOKEN=$REPORT_TOKEN"
+            echo "NOTIONHUB_POLICY_ID=$POLICY_ID"
+            echo "SYNC_RUN_ID=$POLICY_ID"
+            echo "SYNC_PLAN=$PLAN"
+            echo "ENTITLEMENT_PLAN=$PLAN"
+            echo "SYNC_POLICY_JSON=$POLICY_JSON"
+            echo "SYNC_POLICY_SIGNATURE=$POLICY_SIGNATURE"
+            echo "SYNC_POLICY_SIGNING_KEY=$ACCESS_TOKEN"
+            echo "NOTIONHUB_TARGET_RESULTS_PATH=$GITHUB_WORKSPACE/notionhub-target-results.json"
+            echo 'FLOMO_CONFIG<<NOTIONHUB_CONFIG_EOF'
+            echo "$SERVICE_CONFIG"
+            echo 'NOTIONHUB_CONFIG_EOF'
+          } >> "$GITHUB_ENV"
+          echo "plan=$PLAN" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Python 环境
+        if: steps.authorize.outcome == 'success'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 安装运行依赖
+        id: install
+        if: steps.authorize.outcome == 'success'
+        run: |
+          python -m pip install --quiet --disable-pip-version-check --upgrade pip
+          if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
+          SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements flomo)
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+
+      - name: 同步 Flomo
+        id: sync
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: '1'
+          TZ: Asia/Shanghai
+          RAW_ACTION_PAYLOAD: ${{ github.event.inputs.payload || '{}' }}
+          INPUT_SYNC_MODE: ${{ github.event.inputs.sync_mode || '' }}
+          SUPPORTS_FULL_SYNC: 'true'
+          NOTIONHUB_DEFER_FILES: 'true'
+        run: |
+          REQUESTED_SYNC_MODE=$(jq -nr --arg raw "$RAW_ACTION_PAYLOAD" --arg input "$INPUT_SYNC_MODE" --arg server "${NOTIONHUB_CAPTURE_SYNC_MODE:-}" '($raw | fromjson? // {}) as $payload | ($payload.requestedSyncMode // $payload.syncMode // $payload.sync_mode // "") as $payload_mode | (if $server == "full" or $server == "incremental" then $server elif $payload_mode == "full" or $payload_mode == "incremental" then $payload_mode elif $input == "full" or $input == "incremental" then $input else "incremental" end)')
+          CONFIG_INITIAL_FULL_SYNC_REQUIRED=$(printf '%s' "$FLOMO_CONFIG" | jq -r '(.FLOMO_INITIAL_FULL_SYNC_REQUIRED // false) | tostring' 2>/dev/null || echo "false")
+          PAYLOAD_INITIAL_FULL_SYNC_REQUIRED=$(jq -nr --arg raw "$RAW_ACTION_PAYLOAD" '($raw | fromjson? // {}) | (.initialFullSyncForced // false) | tostring')
+          if [ "$CONFIG_INITIAL_FULL_SYNC_REQUIRED" = "true" ] || [ "$PAYLOAD_INITIAL_FULL_SYNC_REQUIRED" = "true" ]; then
+            EFFECTIVE_SYNC_MODE=full
+            INITIAL_FULL_SYNC_FORCED=true
+          else
+            EFFECTIVE_SYNC_MODE="$REQUESTED_SYNC_MODE"
+            INITIAL_FULL_SYNC_FORCED=false
+          fi
+          ACTION_PAYLOAD=$(jq -cn --arg raw "$RAW_ACTION_PAYLOAD" --arg requested "$REQUESTED_SYNC_MODE" --arg effective "$EFFECTIVE_SYNC_MODE" --arg forced "$INITIAL_FULL_SYNC_FORCED" '($raw | fromjson? // {}) | del(.repair_after_sync, .run_safe_repair_after_sync) + {requestedSyncMode:$requested,syncMode:$effective,sync_mode:$effective,effectiveSyncMode:$effective,initialFullSyncForced:($forced == "true"),repair:false,runSafeRepairAfterSync:false}')
+          {
+            echo "NOTIONHUB_ACTION_PAYLOAD=$ACTION_PAYLOAD"
+            echo "NOTIONHUB_REQUESTED_SYNC_MODE=$REQUESTED_SYNC_MODE"
+            echo "NOTIONHUB_EFFECTIVE_SYNC_MODE=$EFFECTIVE_SYNC_MODE"
+            echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
+          } >> "$GITHUB_ENV"
+          export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
+          if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
+            echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
+            exit 1
+          fi
+          if [ "$EFFECTIVE_SYNC_MODE" = "full" ] && [ "$SUPPORTS_FULL_SYNC" != "true" ]; then
+            echo "::error title=全量更新不可用::Flomo 暂不支持全量更新，请改用普通同步。"
+            exit 1
+          fi
+          cd runner
+          python - <<'PY'
+          import json, os
+          raw = os.environ.get('FLOMO_CONFIG', '{}')
+          try: values = json.loads(raw).values()
+          except Exception: values = [raw]
+          for value in values:
+              escaped = str(value).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              if len(escaped) >= 8: print(f'::add-mask::{escaped}')
+          PY
+          python -m notionhub_runner sync flomo
+      - name: 确认首次全量同步完成
+        if: steps.sync.outcome == 'success'
+        run: |
+          if [ "$NOTIONHUB_INITIAL_FULL_SYNC_FORCED" != "true" ]; then exit 0; fi
+          PAYLOAD=$(jq -cn --arg service "flomo" --arg repository "${{ github.repository }}" --arg run_id "${{ github.run_id }}" --arg requested "$NOTIONHUB_REQUESTED_SYNC_MODE" --arg effective "$NOTIONHUB_EFFECTIVE_SYNC_MODE" '{service:$service,repository:$repository,githubRunId:$run_id,status:"success",requestedMode:$requested,effectiveMode:$effective,initialFullSyncForced:true}')
+          curl -fsSL -X POST "$NOTIONHUB_API_BASE/internal/initial-full-sync/complete"             -H "Authorization: Bearer $NOTIONHUB_RUN_ACCESS_TOKEN" -H 'Content-Type: application/json' --data "$PAYLOAD" >/dev/null
+
+
+      - name: 提交运行结果
+        id: settle
+        if: always() && steps.authorize.outcome == 'success'
+        run: |
+          if [ "${{ steps.sync.outcome }}" = "success" ]; then STATUS=success; else STATUS=failure; fi
+          SETTLEMENT_REPORT="$RUNNER_TEMP/notionhub-settlement.json"
+          if [ -d runner/notionhub_runner ]; then
+            (cd runner && python -m notionhub_runner report flomo --status "$STATUS" --output "$SETTLEMENT_REPORT" --failure-class "${NOTIONHUB_FAILURE_CLASS:-platform}")
+          else
+            jq -cn --arg service "flomo" --arg status "$STATUS" '{service:$service,status:$status,primaryItemsCreated:0,primaryItemsUpdated:0,effectiveWrites:0,failureClass:"platform"}' > "$SETTLEMENT_REPORT"
+          fi
+          curl -fsSL -X POST "$NOTIONHUB_API_BASE/internal/trial-runs/$NOTIONHUB_POLICY_ID/report"             -H "Authorization: Bearer $NOTIONHUB_REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$SETTLEMENT_REPORT" >/dev/null
+
+      - name: 生成运行摘要
+        if: always() && steps.authorize.outcome == 'success'
+        run: |
+          case "${{ steps.sync.outcome }}" in
+            success) RESULT="同步成功" ;;
+            failure) RESULT="同步失败" ;;
+            cancelled) RESULT="已取消" ;;
+            *) RESULT="未执行" ;;
+          esac
+          if [ "${{ github.event_name }}" = "schedule" ]; then TRIGGER="定时运行"; else TRIGGER="手动运行"; fi
+          if [ "$NOTIONHUB_EFFECTIVE_SYNC_MODE" = "full" ]; then MODE_LABEL="全量更新"; else MODE_LABEL="增量同步"; fi
+          {
+            echo "## Flomo同步"
+            echo ""
+            echo "| 项目 | 内容 |"
+            echo "| --- | --- |"
+            echo "| 结果 | $RESULT |"
+            echo "| 模式 | $MODE_LABEL |"
+            echo "| 触发方式 | $TRIGGER |"
+            echo "| 运行记录 | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 确认同步成功
+        if: always() && steps.activation.outputs.enabled == 'true' && steps.authorize.outcome == 'success'
+        run: |
+          if [ "${{ steps.sync.outcome }}" != "success" ]; then exit 1; fi
