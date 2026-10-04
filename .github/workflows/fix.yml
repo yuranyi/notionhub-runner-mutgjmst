@@ -1,0 +1,173 @@
+# NotionHub generated workflow v31
+name: 修复数据
+run-name: ${{ github.workflow }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      notionhub_run_id:
+        description: NotionHub 内部运行标识
+        required: false
+        default: ''
+      service:
+        description: 同步服务
+        required: true
+      action:
+        description: 修复动作
+        required: false
+        default: repair-notion-data
+      payload:
+        description: 修复参数 JSON
+        required: false
+        default: '{}'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: notionhub-fix-${{ github.event.inputs.service }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    env:
+      NOTIONHUB_API_BASE: https://i.notionhub.app/v1
+      NOTIONHUB_CONFIG_VERSION: '51'
+      WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
+      PODCAST_CONFIG: ${{ secrets.PODCAST_CONFIG }}
+      DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
+      BILIBILI_CONFIG: ${{ secrets.BILIBILI_CONFIG }}
+      FLOMO_CONFIG: ${{ secrets.FLOMO_CONFIG }}
+      DIDA_CONFIG: ${{ secrets.DIDA_CONFIG }}
+      NETEASEMUSIC_CONFIG: ${{ secrets.NETEASEMUSIC_CONFIG }}
+      KEEP_CONFIG: ${{ secrets.KEEP_CONFIG }}
+      STRAVA_CONFIG: ${{ secrets.STRAVA_CONFIG }}
+      DUOLINGO_CONFIG: ${{ secrets.DUOLINGO_CONFIG }}
+      BBDC_CONFIG: ${{ secrets.BBDC_CONFIG }}
+      FOREST_CONFIG: ${{ secrets.FOREST_CONFIG }}
+      TOGGL_CONFIG: ${{ secrets.TOGGL_CONFIG }}
+      APPLEMUSIC_CONFIG: ${{ secrets.APPLEMUSIC_CONFIG }}
+      APPLEPODCAST_CONFIG: ${{ secrets.APPLEPODCAST_CONFIG }}
+      SPOTIFY_CONFIG: ${{ secrets.SPOTIFY_CONFIG }}
+      TRAKT_CONFIG: ${{ secrets.TRAKT_CONFIG }}
+      XIAOHONGSHU_CONFIG: ${{ secrets.XIAOHONGSHU_CONFIG }}
+      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+      YOUTUBE_CONFIG: ${{ secrets.YOUTUBE_CONFIG }}
+      GUWENDAO_CONFIG: ${{ secrets.GUWENDAO_CONFIG }}
+      GHSTAR_CONFIG: ${{ secrets.GHSTAR_CONFIG }}
+      DAILY_CONFIG: ${{ secrets.DAILY_CONFIG }}
+      TELEGRAM_CONFIG: ${{ secrets.TELEGRAM_CONFIG }}
+      X_CONFIG: ${{ secrets.X_CONFIG }}
+      WEIBO_CONFIG: ${{ secrets.WEIBO_CONFIG }}
+      JIKE_CONFIG: ${{ secrets.JIKE_CONFIG }}
+    steps:
+      - name: 验证修复配置
+        id: validate
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          PREFIX=$(printf '%s' "$SERVICE" | tr '[:lower:]-' '[:upper:]_')
+          CONFIG_NAME="$PREFIX"_CONFIG
+          SERVICE_CONFIG="${!CONFIG_NAME}"
+          if [ -z "$SERVICE_CONFIG" ]; then
+            echo "::error title=服务尚未配置::缺少 $CONFIG_NAME。"
+            exit 1
+          fi
+          PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r --arg key "$PREFIX"_SYNC_PLAN '.[$key] // "lifetime"')
+          if [ "$PLAN" != "lifetime" ]; then
+            echo "::error title=免费体验不支持修复::请激活服务后再执行数据修复。"
+            exit 1
+          fi
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "config_name=$CONFIG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 获取短期修复授权
+        id: authorize
+        run: |
+          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
+          echo "::add-mask::$OIDC_TOKEN"
+          AUTH_RESPONSE="$RUNNER_TEMP/notionhub-authorize.json"
+          HTTP_STATUS=$(curl -sS -o "$AUTH_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/authorize-run"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json'             --data "{\"service\":\"${{ steps.validate.outputs.service }}\",\"purpose\":\"fix\"}")
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            MESSAGE=$(jq -r '.message // "修复授权失败"' "$AUTH_RESPONSE")
+            echo "::error title=修复授权失败::$MESSAGE"
+            exit 1
+          fi
+          for KEY in accessToken bundleToken reportToken; do
+            VALUE=$(jq -r ".data.$KEY // empty" "$AUTH_RESPONSE")
+            if [ -n "$VALUE" ]; then echo "::add-mask::$VALUE"; fi
+          done
+          ACCESS_TOKEN=$(jq -r '.data.accessToken' "$AUTH_RESPONSE")
+          BUNDLE_TOKEN=$(jq -r '.data.bundleToken' "$AUTH_RESPONSE")
+          REPORT_TOKEN=$(jq -r '.data.reportToken' "$AUTH_RESPONSE")
+          POLICY_ID=$(jq -r '.data.context.id' "$AUTH_RESPONSE")
+          BUNDLE_URL=$(jq -r '.data.bundleUrl' "$AUTH_RESPONSE")
+          echo "::add-mask::$POLICY_ID"
+          {
+            echo "NOTIONHUB_RUN_ACCESS_TOKEN=$ACCESS_TOKEN"
+            echo "NOTIONHUB_BUNDLE_TOKEN=$BUNDLE_TOKEN"
+            echo "NOTIONHUB_REPORT_TOKEN=$REPORT_TOKEN"
+            echo "NOTIONHUB_POLICY_ID=$POLICY_ID"
+            echo "NOTIONHUB_BUNDLE_URL=$BUNDLE_URL"
+          } >> "$GITHUB_ENV"
+
+      - name: 获取修复程序
+        id: bundle
+        run: |
+          curl -fsSL "$NOTIONHUB_BUNDLE_URL" -H "Authorization: Bearer $NOTIONHUB_BUNDLE_TOKEN" -o "$RUNNER_TEMP/notionhub-runner.tar.gz"
+          if tar -tzf "$RUNNER_TEMP/notionhub-runner.tar.gz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo "::error title=运行程序校验失败::bundle 包含不安全路径。"
+            exit 1
+          fi
+          tar -xzf "$RUNNER_TEMP/notionhub-runner.tar.gz"
+          test -d runner/notionhub_runner
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 安装修复依赖
+        run: |
+          python -m pip install --quiet --disable-pip-version-check --upgrade pip
+          if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
+          SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements "${{ steps.validate.outputs.service }}")
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+
+      - name: 修复数据
+        id: fix
+        continue-on-error: true
+        env:
+          NOTIONHUB_ACTION_PAYLOAD: ${{ github.event.inputs.payload || '{}' }}
+          SERVICE: ${{ steps.validate.outputs.service }}
+          ACTION_NAME: ${{ github.event.inputs.action || 'repair-notion-data' }}
+        run: |
+          cd runner
+          python -m notionhub_runner fix "$SERVICE" "$ACTION_NAME" --payload "$NOTIONHUB_ACTION_PAYLOAD"
+
+      - name: 上报修复结果
+        if: always() && steps.authorize.outcome == 'success'
+        run: |
+          if [ "${{ steps.fix.outcome }}" = "success" ]; then STATUS=success; else STATUS=failure; fi
+          REPORT=$(jq -cn --arg service "${{ steps.validate.outputs.service }}" --arg status "$STATUS" '{service:$service,status:$status,primaryItemsCreated:0,primaryItemsUpdated:0,effectiveWrites:0}')
+          curl -fsSL -X POST "$NOTIONHUB_API_BASE/internal/trial-runs/$NOTIONHUB_POLICY_ID/report"             -H "Authorization: Bearer $NOTIONHUB_REPORT_TOKEN" -H 'Content-Type: application/json' --data "$REPORT" >/dev/null
+
+      - name: 生成修复摘要
+        if: always()
+        run: |
+          if [ "${{ steps.fix.outcome }}" = "success" ]; then RESULT="修复成功"; else RESULT="修复失败"; fi
+          {
+            echo "## NotionHub 数据修复"
+            echo ""
+            echo "| 项目 | 内容 |"
+            echo "| --- | --- |"
+            echo "| 服务 | ${{ github.event.inputs.service }} |"
+            echo "| 动作 | ${{ github.event.inputs.action || 'repair-notion-data' }} |"
+            echo "| 结果 | $RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 确认修复成功
+        if: always()
+        run: |
+          if [ "${{ steps.fix.outcome }}" != "success" ]; then exit 1; fi
